@@ -1,0 +1,21 @@
+.streamlit/secrets.toml
+
+# Personal / generated data - never commit
+resume.pdf
+professional_background.json
+payload.json
+job_search_memory.db
+health_check.log
+*.log
+resume_vectors_db/
+generated_documents/
+source_documents/
+cats.jpg
+
+# Credentials
+*.key
+*.crt
+
+# Python
+__pycache__/
+*.pyc
