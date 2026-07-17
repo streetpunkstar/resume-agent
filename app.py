@@ -173,11 +173,79 @@ def build_ats_docx_bytes(sections: dict) -> bytes:
 st.set_page_config(page_title="Interactive Resume Bot", page_icon="💼", layout="centered")
 
 
-def render_application_materials(namespace: str):
-    CREWAI_VENV_PYTHON = "/home/liberty/crewai/crewai-env/bin/python"
-    CREWAI_SCRIPT_PATH = "/home/liberty/resume-bot/job_assistant.py"
-    OUTPUT_DIR = "/home/liberty/resume-bot/generated_documents"
+CREWAI_VENV_PYTHON = "/home/liberty/crewai/crewai-env/bin/python"
+CREWAI_SCRIPT_PATH = "/home/liberty/resume-bot/job_assistant.py"
+GENERATED_DOCS_DIR = "/home/liberty/resume-bot/generated_documents"
 
+# Runs on every script execution (Streamlit reruns this whole file on each
+# interaction) so the job-search DB schema is always current no matter which
+# tab a user opens first — cheap and idempotent (CREATE TABLE IF NOT EXISTS
+# plus try/except ALTER TABLE migrations).
+from agent_memory import init_memory as _init_job_search_memory
+_init_job_search_memory()
+
+
+def run_application_materials_crew(posting_text: str, run_id: str) -> dict:
+    """
+    Runs job_assistant.py's crew once for a given job posting, returns every
+    generated output as a dict. Shared by render_application_materials() (the
+    manual paste-one-posting flow) and render_job_tracker() (generating a
+    packet directly from a job search lead) — one implementation, so a fix
+    or change here applies to both callers instead of drifting apart.
+    """
+    result_file = f"{GENERATED_DOCS_DIR}/last_job_analysis_result_{run_id}.txt"
+    ats_file = f"{GENERATED_DOCS_DIR}/last_ats_resume_result_{run_id}.json"
+    job_analysis_file = f"{GENERATED_DOCS_DIR}/last_job_analysis_structured_{run_id}.json"
+    match_analysis_file = f"{GENERATED_DOCS_DIR}/last_match_analysis_result_{run_id}.json"
+    fact_check_file = f"{GENERATED_DOCS_DIR}/last_fact_check_result_{run_id}.json"
+
+    output = {"success": False, "error": None, "reasoning": ""}
+
+    try:
+        proc = subprocess.run(
+            [CREWAI_VENV_PYTHON, CREWAI_SCRIPT_PATH],
+            input=posting_text,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env={**os.environ, "NO_COLOR": "1", "TERM": "dumb", "RUN_ID": run_id},
+        )
+        output["reasoning"] = ANSI_ESCAPE_RE.sub("", proc.stdout).strip()
+
+        if proc.returncode != 0:
+            output["error"] = f"Crew run failed:\n{proc.stderr}"
+            return output
+        if not os.path.isfile(result_file):
+            output["error"] = "Crew finished but no result file was found — check job_assistant.py runs cleanly on its own first."
+            return output
+
+        with open(result_file, "r") as f:
+            output["cover_letter"] = f.read().strip()
+        if os.path.isfile(ats_file):
+            with open(ats_file, "r") as f:
+                output["ats_resume_data"] = json.load(f)
+        if os.path.isfile(job_analysis_file):
+            with open(job_analysis_file, "r") as f:
+                output["job_analysis"] = json.load(f)
+        if os.path.isfile(match_analysis_file):
+            with open(match_analysis_file, "r") as f:
+                output["match_analysis"] = json.load(f)
+        if os.path.isfile(fact_check_file):
+            with open(fact_check_file, "r") as f:
+                output["fact_check"] = json.load(f)
+
+        output["success"] = True
+        return output
+
+    except subprocess.TimeoutExpired:
+        output["error"] = "The crew took longer than the timeout allows — check job_assistant.py runs cleanly on its own first."
+        return output
+    except json.JSONDecodeError as e:
+        output["error"] = f"A result file wasn't valid JSON: {e}"
+        return output
+
+
+def render_application_materials(namespace: str):
     def key(name):
         return f"{namespace}_{name}"
 
@@ -191,52 +259,18 @@ def render_application_materials(namespace: str):
             st.warning("Paste a job posting first.")
         else:
             run_id = uuid.uuid4().hex[:8]
-            result_file = f"{OUTPUT_DIR}/last_job_analysis_result_{run_id}.txt"
-            ats_file = f"{OUTPUT_DIR}/last_ats_resume_result_{run_id}.json"
-            job_analysis_file = f"{OUTPUT_DIR}/last_job_analysis_structured_{run_id}.json"
-            match_analysis_file = f"{OUTPUT_DIR}/last_match_analysis_result_{run_id}.json"
-            fact_check_file = f"{OUTPUT_DIR}/last_fact_check_result_{run_id}.json"
-
             with st.spinner("Running the crew — this can take a minute or two on local hardware..."):
-                try:
-                    proc = subprocess.run(
-                        [CREWAI_VENV_PYTHON, CREWAI_SCRIPT_PATH],
-                        input=posting_text,
-                        capture_output=True,
-                        text=True,
-                        timeout=300,
-                        env={**os.environ, "NO_COLOR": "1", "TERM": "dumb", "RUN_ID": run_id},
-                    )
-                    if proc.returncode != 0:
-                        st.error(f"Crew run failed:\n{proc.stderr}")
-                    elif not os.path.isfile(result_file):
-                        st.error(
-                            "Crew finished but no result file was found — "
-                            "check job_assistant.py ran cleanly on its own first."
-                        )
-                    else:
-                        with open(result_file, "r") as f:
-                            st.session_state[key("last_cover_letter")] = f.read().strip()
+                result = run_application_materials_crew(posting_text, run_id)
 
-                        if os.path.isfile(ats_file):
-                            with open(ats_file, "r") as f:
-                                st.session_state[key("last_ats_resume_data")] = json.load(f)
-                        if os.path.isfile(job_analysis_file):
-                            with open(job_analysis_file, "r") as f:
-                                st.session_state[key("last_job_analysis")] = json.load(f)
-                        if os.path.isfile(match_analysis_file):
-                            with open(match_analysis_file, "r") as f:
-                                st.session_state[key("last_match_analysis")] = json.load(f)
-                        if os.path.isfile(fact_check_file):
-                            with open(fact_check_file, "r") as f:
-                                st.session_state[key("last_fact_check")] = json.load(f)
-
-                        clean_reasoning = ANSI_ESCAPE_RE.sub("", proc.stdout)
-                        st.session_state[key("last_reasoning")] = clean_reasoning.strip()
-                except subprocess.TimeoutExpired:
-                    st.error("The crew took longer than the timeout allows — check job_assistant.py runs cleanly on its own first.")
-                except json.JSONDecodeError as e:
-                    st.error(f"A result file wasn't valid JSON: {e}")
+            if result["error"]:
+                st.error(result["error"])
+            else:
+                st.session_state[key("last_cover_letter")] = result.get("cover_letter")
+                st.session_state[key("last_ats_resume_data")] = result.get("ats_resume_data")
+                st.session_state[key("last_job_analysis")] = result.get("job_analysis")
+                st.session_state[key("last_match_analysis")] = result.get("match_analysis")
+                st.session_state[key("last_fact_check")] = result.get("fact_check")
+                st.session_state[key("last_reasoning")] = result.get("reasoning")
 
     if st.session_state.get(key("last_cover_letter")) or st.session_state.get(key("last_ats_resume_data")):
         st.success("Application materials ready.")
@@ -296,21 +330,15 @@ def render_application_materials(namespace: str):
 
 def render_job_search_tool(namespace: str):
     """
-    Job search agent UI — searches Adzuna, ranks results by embedding similarity
-    against the candidate's real background, and lets the user teach it
-    dealbreakers over time. Namespaced the same way as
-    render_application_materials(): session_state keys are prefixed per caller
-    (admin vs. coach) so results from one view never bleed into the other in
-    the same browser session.
-
-    The underlying memory (seen jobs, learned dealbreakers) is intentionally
-    NOT namespaced — it's stored in job_search_memory.db and shared globally,
-    since "don't show me a posting I've already seen" and "I don't want C1
-    German postings" are facts about the actual job search, not about which
-    login viewed them.
+    Finds new leads and records them — that's the only job this tab has.
+    Every ACTION on a lead (mark good/bad fit, generate a packet, review it,
+    approve it) happens in the Job Tracker tab instead — previously those
+    actions were split across three different tabs with an overlapping
+    'Generate packet' button in two of them, which was genuinely confusing
+    for anyone new to the tool. One tab finds things, one tab manages them.
     """
     from job_search_agent import run_job_search_agent, COUNTRY_OPTIONS
-    from agent_memory import record_feedback, add_learned_dealbreaker, get_learned_dealbreakers
+    from agent_memory import add_learned_dealbreaker, get_learned_dealbreakers
 
     def key(name):
         return f"{namespace}_{name}"
@@ -341,6 +369,7 @@ def render_job_search_tool(namespace: str):
         if not jobs:
             st.info("No new jobs found this run — either nothing new matched, or everything was already shown previously.")
         else:
+            st.success(f"Found {len(jobs)} new job(s) — go to the **🗂️ Job Tracker** tab to review and act on them.")
             for job in jobs:
                 with st.container(border=True):
                     flags = []
@@ -348,21 +377,13 @@ def render_job_search_tool(namespace: str):
                         flags.append(job["contract_type"])
                     if job.get("contract_time", "not specified") != "not specified":
                         flags.append(job["contract_time"])
-                    if job.get("possible_language_requirement"):
-                        flags.append("⚠️ possible language requirement")
+                    for dealbreaker_flag in job.get("dealbreaker_flags", []):
+                        flags.append(f"⚠️ {dealbreaker_flag}")
                     flag_str = " · ".join(flags)
 
                     st.markdown(f"**{job['title']}** — {job['company']} ({job['location']})")
                     st.caption(f"Similarity: {job['similarity']:.2f}" + (f" · {flag_str}" if flag_str else ""))
                     st.markdown(f"[View posting]({job['url']})")
-
-                    b1, b2 = st.columns(2)
-                    if b1.button("👍 Good fit", key=key(f"good_{job['url']}")):
-                        record_feedback(job["url"], "good_fit")
-                        st.success("Marked as a good fit.")
-                    if b2.button("👎 Not a fit", key=key(f"bad_{job['url']}")):
-                        record_feedback(job["url"], "bad_fit")
-                        st.info("Marked as not a fit.")
 
     st.divider()
     st.subheader("Teach a dealbreaker")
@@ -378,6 +399,202 @@ def render_job_search_tool(namespace: str):
     existing = get_learned_dealbreakers()
     if existing:
         st.caption("Currently watching for: " + ", ".join(f"`{p}`" for p in existing))
+
+
+def render_job_tracker(namespace: str):
+    """
+    THE single place every job lead lives out its whole lifecycle — find →
+    mark fit → generate packet → review the two documents → approve/reject.
+    Previously this was split across three tabs (Job Search had its own
+    'Generate packet' button, a separate Review Queue tab did the actual
+    reviewing/approving, and this tab only showed status) — confusing for
+    anyone new to the tool, since the same action existed in two different
+    places. Now: Job Search only finds and records; everything else happens
+    here, in one place, in the order it actually happens.
+
+    Since seen_jobs/review_queue are shared (not namespaced) between admin
+    and coach, this view is identical for both — either of you can see
+    exactly what the other has already done with any given lead.
+    """
+    from agent_memory import init_memory, get_job_tracker, record_feedback, add_to_review_queue, update_review_status
+
+    init_memory()
+
+    def key(name):
+        return f"{namespace}_{name}"
+
+    def load_packet_files(run_id):
+        result_file = f"{GENERATED_DOCS_DIR}/last_job_analysis_result_{run_id}.txt"
+        ats_file = f"{GENERATED_DOCS_DIR}/last_ats_resume_result_{run_id}.json"
+        job_analysis_file = f"{GENERATED_DOCS_DIR}/last_job_analysis_structured_{run_id}.json"
+        fact_check_file = f"{GENERATED_DOCS_DIR}/last_fact_check_result_{run_id}.json"
+
+        cover_letter, ats_data, job_analysis, fact_check = None, None, None, None
+        if os.path.isfile(result_file):
+            with open(result_file, "r") as f:
+                cover_letter = f.read().strip()
+        if os.path.isfile(ats_file):
+            with open(ats_file, "r") as f:
+                ats_data = json.load(f)
+        if os.path.isfile(job_analysis_file):
+            with open(job_analysis_file, "r") as f:
+                job_analysis = json.load(f)
+        if os.path.isfile(fact_check_file):
+            with open(fact_check_file, "r") as f:
+                fact_check = json.load(f)
+        return cover_letter, ats_data, job_analysis, fact_check
+
+    def render_packet_downloads(url, company, cover_letter, ats_data, job_analysis, key_prefix):
+        company_name = job_analysis.get("company_name", company) if job_analysis else company
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            if cover_letter:
+                st.download_button(
+                    "⬇️ Cover letter (.docx)",
+                    data=build_cover_letter_docx(cover_letter),
+                    file_name=build_output_filename(company_name, "Cover Letter"),
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=key(f"{key_prefix}_cl_{url}"),
+                )
+        with dl2:
+            if ats_data:
+                st.download_button(
+                    "⬇️ ATS resume (.docx)",
+                    data=build_ats_docx_bytes(ats_data),
+                    file_name=build_output_filename(company_name, "ATS Resume"),
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    key=key(f"{key_prefix}_ats_{url}"),
+                )
+
+    with st.expander("ℹ️ How this works", expanded=False):
+        st.markdown(
+            "1. **Find** — search for jobs in the Job Search tab.\n"
+            "2. **Mark it** — 👍 good fit or 👎 not a fit, right here.\n"
+            "3. **Generate** — for a good fit, click 📝 to draft a cover letter + resume for it.\n"
+            "4. **Review** — read the two documents and the warning flags below them.\n"
+            "5. **Approve or reject** — approving does *not* submit anything anywhere. "
+            "It just means the documents are ready. Go to the actual job posting "
+            "and apply yourself, using the downloaded files."
+        )
+
+    tracker = get_job_tracker()
+    if not tracker:
+        st.info("No jobs found yet — run a search from the Job Search tab.")
+        return
+
+    STATUS_LABELS = {
+        "new": "🆕 New",
+        "good_fit": "👍 Good fit",
+        "bad_fit": "👎 Not a fit",
+        "pending": "📝 Ready for your review",
+        "approved": "✅ Approved",
+        "rejected": "❌ Rejected",
+    }
+
+    # Everything still needing a human decision — including packets sitting
+    # in review, which previously lived in a separate tab as if reviewing
+    # were a different kind of task than the rest of the lifecycle. It isn't.
+    needs_action = [j for j in tracker if j["status"] in ("new", "good_fit", "pending")]
+    settled = [j for j in tracker if j["status"] in ("bad_fit", "approved", "rejected")]
+
+    if needs_action:
+        st.subheader(f"Needs your attention ({len(needs_action)})")
+    else:
+        st.success("Nothing waiting on you right now.")
+
+    for job in needs_action:
+        with st.container(border=True):
+            st.markdown(f"**{job['title']}** — {job['company']}" + (f" ({job['location']})" if job.get("location") else ""))
+            sim_str = f" · similarity {job['similarity']:.2f}" if job.get("similarity") is not None else ""
+            st.caption(f"{STATUS_LABELS[job['status']]}{sim_str} · first seen {job['first_seen']}")
+            st.markdown(f"[View posting]({job['url']})")
+
+            if job["status"] in ("new", "good_fit"):
+                b1, b2, b3 = st.columns(3)
+                if b1.button("👍 Good fit", key=key(f"tracker_good_{job['url']}")):
+                    record_feedback(job["url"], "good_fit")
+                    st.rerun()
+                if b2.button("👎 Not a fit", key=key(f"tracker_bad_{job['url']}")):
+                    record_feedback(job["url"], "bad_fit")
+                    st.rerun()
+                if b3.button("📝 Generate packet", key=key(f"tracker_packet_{job['url']}")):
+                    st.session_state[key(f"show_paste_{job['url']}")] = not job["description"]
+                    if job["description"]:
+                        posting_text = f"{job['title']} at {job['company']}\n\n{job['description']}"
+                        run_id = uuid.uuid4().hex[:8]
+                        with st.spinner("Running the crew — this can take a minute or two on local hardware..."):
+                            result = run_application_materials_crew(posting_text, run_id)
+                        if result["error"]:
+                            st.error(result["error"])
+                        else:
+                            add_to_review_queue(job["url"], job["title"], job["company"], run_id)
+                            st.success("Packet generated — scroll down to review it.")
+                            st.rerun()
+
+                # Recovery path for jobs found before descriptions were
+                # stored — re-searching can NEVER surface this job again
+                # (filter_unseen excludes anything already seen), so the
+                # only real fix is letting you paste the posting yourself,
+                # using the "View posting" link above.
+                if not job["description"] or st.session_state.get(key(f"show_paste_{job['url']}")):
+                    st.warning("No description was stored for this job (found before this feature existed).")
+                    pasted_text = st.text_area(
+                        "Paste the job posting text from the link above, then click Generate again",
+                        key=key(f"paste_{job['url']}"),
+                    )
+                    if st.button("📝 Generate from pasted text", key=key(f"generate_pasted_{job['url']}")):
+                        if not pasted_text.strip():
+                            st.warning("Paste the posting text first.")
+                        else:
+                            posting_text = f"{job['title']} at {job['company']}\n\n{pasted_text}"
+                            run_id = uuid.uuid4().hex[:8]
+                            with st.spinner("Running the crew — this can take a minute or two on local hardware..."):
+                                result = run_application_materials_crew(posting_text, run_id)
+                            if result["error"]:
+                                st.error(result["error"])
+                            else:
+                                add_to_review_queue(job["url"], job["title"], job["company"], run_id)
+                                st.session_state[key(f"show_paste_{job['url']}")] = False
+                                st.success("Packet generated — scroll down to review it.")
+                                st.rerun()
+
+            elif job["status"] == "pending":
+                cover_letter, ats_data, job_analysis, fact_check = load_packet_files(job["run_id"])
+
+                if job_analysis:
+                    render_language_requirement(job_analysis)
+                    render_visa_sponsorship(job_analysis)
+                if fact_check:
+                    render_fact_check(fact_check)
+
+                with st.expander("Preview cover letter"):
+                    st.write(cover_letter or "Not available.")
+                with st.expander("Preview ATS resume sections"):
+                    st.json(ats_data or {})
+
+                render_packet_downloads(job["url"], job["company"], cover_letter, ats_data, job_analysis, "pending")
+
+                a1, a2 = st.columns(2)
+                if a1.button("✅ Approve — I've reviewed this", key=key(f"approve_{job['url']}"), type="primary"):
+                    update_review_status(job["url"], "approved")
+                    st.success("Approved. Go apply on the actual job site yourself — this tool never submits anything automatically.")
+                    st.rerun()
+                if a2.button("❌ Reject", key=key(f"reject_{job['url']}")):
+                    update_review_status(job["url"], "rejected")
+                    st.rerun()
+
+    if settled:
+        with st.expander(f"History ({len(settled)})"):
+            for job in settled:
+                st.markdown(f"**{STATUS_LABELS.get(job['status'], job['status'])}** — {job['title']} ({job['company']}), first seen {job['first_seen']}")
+                if job["status"] == "bad_fit":
+                    if st.button("🔄 Reconsider — move back to new", key=key(f"undo_{job['url']}")):
+                        record_feedback(job["url"], None)
+                        st.rerun()
+                if job["status"] == "approved" and job.get("run_id"):
+                    cover_letter, ats_data, job_analysis, _ = load_packet_files(job["run_id"])
+                    render_packet_downloads(job["url"], job["company"], cover_letter, ats_data, job_analysis, "history")
+                st.divider()
 
 
 def render_maintenance_tools():
@@ -624,8 +841,8 @@ if role == "admin":
     visitors_df = pd.read_csv(VISITOR_LOG_FILE) if os.path.isfile(VISITOR_LOG_FILE) else pd.DataFrame()
     convo_df = pd.read_csv(CONVO_LOG_FILE) if os.path.isfile(CONVO_LOG_FILE) else pd.DataFrame()
 
-    tab_analytics, tab_visitors, tab_conversations, tab_application_materials, tab_job_search, tab_maintenance = st.tabs(
-        ["📊 Analytics", "👥 Visitors", "💬 Conversations", "📋 Application Materials", "🔎 Job Search", "🧹 Maintenance"]
+    tab_analytics, tab_visitors, tab_conversations, tab_application_materials, tab_job_search, tab_job_tracker, tab_maintenance = st.tabs(
+        ["📊 Analytics", "👥 Visitors", "💬 Conversations", "📋 Application Materials", "🔎 Job Search", "🗂️ Job Tracker", "🧹 Maintenance"]
     )
 
     with tab_analytics:
@@ -676,6 +893,9 @@ if role == "admin":
     with tab_job_search:
         render_job_search_tool(namespace="admin")
 
+    with tab_job_tracker:
+        render_job_tracker(namespace="admin")
+
     with tab_maintenance:
         render_maintenance_tools()
 
@@ -684,12 +904,16 @@ if role == "admin":
 
 if role == "coach":
     st.title("💼 Career Coach Tools")
-    tab_application_materials, tab_job_search = st.tabs(["📋 Application Materials", "🔎 Job Search"])
+    tab_application_materials, tab_job_search, tab_job_tracker = st.tabs(
+        ["📋 Application Materials", "🔎 Job Search", "🗂️ Job Tracker"]
+    )
     with tab_application_materials:
         st.write("Paste a job posting below to generate a tailored cover letter and ATS-friendly resume.")
         render_application_materials(namespace="coach")
     with tab_job_search:
         render_job_search_tool(namespace="coach")
+    with tab_job_tracker:
+        render_job_tracker(namespace="coach")
     st.stop()
 
 
