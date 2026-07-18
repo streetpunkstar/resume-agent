@@ -29,7 +29,7 @@ def init_memory():
     # Migrations for databases created before these columns existed —
     # CREATE TABLE IF NOT EXISTS doesn't add columns to an already-existing
     # table, so this handles upgrading a DB that's already on disk.
-    for column_def in ["description TEXT", "location TEXT", "similarity REAL"]:
+    for column_def in ["description TEXT", "location TEXT", "similarity REAL", "source TEXT"]:
         try:
             conn.execute(f"ALTER TABLE seen_jobs ADD COLUMN {column_def}")
         except sqlite3.OperationalError:
@@ -122,15 +122,16 @@ def record_shown(jobs: list[dict]):
     now = datetime.now().isoformat()
     for job in jobs:
         conn.execute("""
-            INSERT INTO seen_jobs (url, title, company, first_seen, feedback, description, location, similarity)
-            VALUES (?, ?, ?, ?, NULL, ?, ?, ?)
+            INSERT INTO seen_jobs (url, title, company, first_seen, feedback, description, location, similarity, source)
+            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
             ON CONFLICT(url) DO UPDATE SET
                 description = excluded.description,
                 location = excluded.location,
-                similarity = excluded.similarity
+                similarity = excluded.similarity,
+                source = excluded.source
         """, (
             job["url"], job["title"], job["company"], now,
-            job.get("description", ""), job.get("location", ""), job.get("similarity"),
+            job.get("description", ""), job.get("location", ""), job.get("similarity"), job.get("source", ""),
         ))
     conn.commit()
     conn.close()
@@ -208,6 +209,16 @@ def check_learned_dealbreakers(description: str) -> list[dict]:
     return [{"pattern": pattern, "reason": reason} for pattern, reason in rows if pattern in lowered]
 
 
+def update_job_description(url: str, description: str):
+    """Backfills a description for a job that didn't get one the first
+    time — either via automatic re-fetch (Arbeitsagentur, where the refnr
+    can be recovered from the URL) or manual paste."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE seen_jobs SET description = ? WHERE url = ?", (description, url))
+    conn.commit()
+    conn.close()
+
+
 def get_job_tracker() -> list[dict]:
     """The persistent, shared 'what's the state of every job we've found'
     view — addresses a real gap: seen_jobs only existed to avoid re-showing
@@ -227,6 +238,7 @@ def get_job_tracker() -> list[dict]:
             seen_jobs.description,
             seen_jobs.location,
             seen_jobs.similarity,
+            seen_jobs.source,
             review_queue.status,
             review_queue.run_id
         FROM seen_jobs
@@ -236,7 +248,7 @@ def get_job_tracker() -> list[dict]:
     conn.close()
 
     tracker = []
-    for url, title, company, first_seen, feedback, description, location, similarity, rq_status, run_id in rows:
+    for url, title, company, first_seen, feedback, description, location, similarity, source, rq_status, run_id in rows:
         if rq_status:
             derived_status = rq_status  # 'pending', 'approved', or 'rejected'
         elif feedback:
@@ -252,6 +264,7 @@ def get_job_tracker() -> list[dict]:
             "description": description or "",
             "location": location or "",
             "similarity": similarity,
+            "source": source or "",
             "status": derived_status,
             "run_id": run_id,
         })

@@ -170,7 +170,7 @@ def build_ats_docx_bytes(sections: dict) -> bytes:
     doc.save(buffer)
     return buffer.getvalue()
 
-st.set_page_config(page_title="Interactive Resume Bot", page_icon="💼", layout="centered")
+st.set_page_config(page_title="Interactive Resume Bot", page_icon="💼", layout="wide")
 
 
 CREWAI_VENV_PYTHON = "/home/liberty/crewai/crewai-env/bin/python"
@@ -180,7 +180,9 @@ GENERATED_DOCS_DIR = "/home/liberty/resume-bot/generated_documents"
 # Runs on every script execution (Streamlit reruns this whole file on each
 # interaction) so the job-search DB schema is always current no matter which
 # tab a user opens first — cheap and idempotent (CREATE TABLE IF NOT EXISTS
-# plus try/except ALTER TABLE migrations).
+# plus try/except ALTER TABLE migrations). Also called again inside
+# render_job_tracker() as a second line of defense — this call has been
+# dropped by unrelated edits more than once, so don't remove either copy.
 from agent_memory import init_memory as _init_job_search_memory
 _init_job_search_memory()
 
@@ -416,7 +418,8 @@ def render_job_tracker(namespace: str):
     and coach, this view is identical for both — either of you can see
     exactly what the other has already done with any given lead.
     """
-    from agent_memory import init_memory, get_job_tracker, record_feedback, add_to_review_queue, update_review_status
+    from agent_memory import init_memory, get_job_tracker, record_feedback, add_to_review_queue, update_review_status, update_job_description
+    from job_search_agent import refetch_description
 
     init_memory()
 
@@ -488,112 +491,219 @@ def render_job_tracker(namespace: str):
         "bad_fit": "👎 Not a fit",
         "pending": "📝 Ready for your review",
         "approved": "✅ Approved",
+        "applied": "📨 Applied",
         "rejected": "❌ Rejected",
     }
 
-    # Everything still needing a human decision — including packets sitting
-    # in review, which previously lived in a separate tab as if reviewing
-    # were a different kind of task than the rest of the lifecycle. It isn't.
+    # Three tiers, not two — "approved" isn't the same kind of "done" as
+    # "rejected". Rejected/bad_fit are genuinely settled, nothing more to do.
+    # Approved still needs YOU to go apply somewhere — burying it in the same
+    # collapsed history as things you don't care about anymore made it easy
+    # to lose track of what still needs a real-world action.
     needs_action = [j for j in tracker if j["status"] in ("new", "good_fit", "pending")]
-    settled = [j for j in tracker if j["status"] in ("bad_fit", "approved", "rejected")]
+    approved = [j for j in tracker if j["status"] == "approved"]
+    applied = [j for j in tracker if j["status"] == "applied"]
+    settled = [j for j in tracker if j["status"] in ("bad_fit", "rejected")]
 
     if needs_action:
         st.subheader(f"Needs your attention ({len(needs_action)})")
     else:
         st.success("Nothing waiting on you right now.")
 
-    for job in needs_action:
+    # Split by weight, not just status — new/good_fit cards are light
+    # (a few buttons), pending-review cards are heavy (warnings, fact check,
+    # two previews, downloads, approve/reject). Grid the light ones two per
+    # row to use the width wide layout now provides; keep the heavy ones
+    # full-width so their content stays readable. This does mean jobs are no
+    # longer strictly ordered by recency across the whole section — grouped
+    # by weight instead, which reads more clearly than it sounds.
+    light_jobs = [j for j in needs_action if j["status"] in ("new", "good_fit")]
+    pending_jobs = [j for j in needs_action if j["status"] == "pending"]
+
+    def render_light_card(job):
         with st.container(border=True):
-            st.markdown(f"**{job['title']}** — {job['company']}" + (f" ({job['location']})" if job.get("location") else ""))
-            sim_str = f" · similarity {job['similarity']:.2f}" if job.get("similarity") is not None else ""
-            st.caption(f"{STATUS_LABELS[job['status']]}{sim_str} · first seen {job['first_seen']}")
+            st.markdown(f"**{job['title']}**")
+            st.caption(f"{job['company']}" + (f" · {job['location']}" if job.get("location") else ""))
+            sim_str = f"similarity {job['similarity']:.2f} · " if job.get("similarity") is not None else ""
+            st.caption(f"{STATUS_LABELS[job['status']]} · {sim_str}{job['first_seen']}")
             st.markdown(f"[View posting]({job['url']})")
 
-            if job["status"] in ("new", "good_fit"):
-                b1, b2, b3 = st.columns(3)
-                if b1.button("👍 Good fit", key=key(f"tracker_good_{job['url']}")):
-                    record_feedback(job["url"], "good_fit")
-                    st.rerun()
-                if b2.button("👎 Not a fit", key=key(f"tracker_bad_{job['url']}")):
-                    record_feedback(job["url"], "bad_fit")
-                    st.rerun()
-                if b3.button("📝 Generate packet", key=key(f"tracker_packet_{job['url']}")):
-                    st.session_state[key(f"show_paste_{job['url']}")] = not job["description"]
-                    if job["description"]:
-                        posting_text = f"{job['title']} at {job['company']}\n\n{job['description']}"
+            b1, b2, b3 = st.columns(3)
+            if b1.button("👍", key=key(f"tracker_good_{job['url']}"), help="Good fit"):
+                record_feedback(job["url"], "good_fit")
+                st.rerun()
+            if b2.button("👎", key=key(f"tracker_bad_{job['url']}"), help="Not a fit"):
+                record_feedback(job["url"], "bad_fit")
+                st.rerun()
+            if b3.button("📝", key=key(f"tracker_packet_{job['url']}"), help="Generate packet"):
+                st.session_state[key(f"show_paste_{job['url']}")] = not job["description"]
+                if job["description"]:
+                    posting_text = f"{job['title']} at {job['company']}\n\n{job['description']}"
+                    run_id = uuid.uuid4().hex[:8]
+                    with st.spinner("Running the crew — this can take a minute or two..."):
+                        result = run_application_materials_crew(posting_text, run_id)
+                    if result["error"]:
+                        st.error(result["error"])
+                    else:
+                        add_to_review_queue(job["url"], job["title"], job["company"], run_id)
+                        st.success("Generated — see it below.")
+                        st.rerun()
+
+            # Recovery path for jobs missing a description — re-searching
+            # can NEVER surface this job again (filter_unseen excludes
+            # anything already seen), so this is the only way back. Try an
+            # automatic re-fetch first (only works for Arbeitsagentur, since
+            # its URL contains the refnr needed to call the detail endpoint
+            # again); fall back to manual paste for every other source.
+            if not job["description"] or st.session_state.get(key(f"show_paste_{job['url']}")):
+                st.warning("No description stored for this job.")
+                if job.get("source") == "Arbeitsagentur":
+                    if st.button("🔄 Try automatic re-fetch", key=key(f"refetch_{job['url']}")):
+                        with st.spinner("Re-fetching from Arbeitsagentur..."):
+                            fetched = refetch_description(job["url"], job["source"])
+                        if fetched:
+                            update_job_description(job["url"], fetched)
+                            st.success("Description recovered.")
+                            st.rerun()
+                        else:
+                            st.error("Automatic re-fetch failed — paste manually below.")
+                pasted_text = st.text_area("Or paste the posting text, then Generate again", key=key(f"paste_{job['url']}"), height=100)
+                if st.button("📝 Generate from pasted text", key=key(f"generate_pasted_{job['url']}")):
+                    if not pasted_text.strip():
+                        st.warning("Paste the posting text first.")
+                    else:
+                        posting_text = f"{job['title']} at {job['company']}\n\n{pasted_text}"
                         run_id = uuid.uuid4().hex[:8]
-                        with st.spinner("Running the crew — this can take a minute or two on local hardware..."):
+                        with st.spinner("Running the crew..."):
                             result = run_application_materials_crew(posting_text, run_id)
                         if result["error"]:
                             st.error(result["error"])
                         else:
                             add_to_review_queue(job["url"], job["title"], job["company"], run_id)
-                            st.success("Packet generated — scroll down to review it.")
+                            # Persist the pasted text back to memory — otherwise
+                            # a future regenerate would hit this exact same
+                            # empty-description gap all over again.
+                            update_job_description(job["url"], pasted_text)
+                            st.session_state[key(f"show_paste_{job['url']}")] = False
+                            st.success("Generated — see it below.")
                             st.rerun()
 
-                # Recovery path for jobs found before descriptions were
-                # stored — re-searching can NEVER surface this job again
-                # (filter_unseen excludes anything already seen), so the
-                # only real fix is letting you paste the posting yourself,
-                # using the "View posting" link above.
-                if not job["description"] or st.session_state.get(key(f"show_paste_{job['url']}")):
-                    st.warning("No description was stored for this job (found before this feature existed).")
-                    pasted_text = st.text_area(
-                        "Paste the job posting text from the link above, then click Generate again",
-                        key=key(f"paste_{job['url']}"),
-                    )
-                    if st.button("📝 Generate from pasted text", key=key(f"generate_pasted_{job['url']}")):
-                        if not pasted_text.strip():
-                            st.warning("Paste the posting text first.")
-                        else:
-                            posting_text = f"{job['title']} at {job['company']}\n\n{pasted_text}"
-                            run_id = uuid.uuid4().hex[:8]
-                            with st.spinner("Running the crew — this can take a minute or two on local hardware..."):
-                                result = run_application_materials_crew(posting_text, run_id)
-                            if result["error"]:
-                                st.error(result["error"])
-                            else:
-                                add_to_review_queue(job["url"], job["title"], job["company"], run_id)
-                                st.session_state[key(f"show_paste_{job['url']}")] = False
-                                st.success("Packet generated — scroll down to review it.")
-                                st.rerun()
+    if light_jobs:
+        st.markdown(f"**To review ({len(light_jobs)})**")
+        cols = st.columns(2)
+        for i, job in enumerate(light_jobs):
+            with cols[i % 2]:
+                render_light_card(job)
 
-            elif job["status"] == "pending":
-                cover_letter, ats_data, job_analysis, fact_check = load_packet_files(job["run_id"])
+    for job in pending_jobs:
+        with st.container(border=True):
+            st.markdown(f"**{job['title']}** — {job['company']}" + (f" ({job['location']})" if job.get("location") else ""))
+            st.caption(f"{STATUS_LABELS[job['status']]} · first seen {job['first_seen']}")
+            st.markdown(f"[View posting]({job['url']})")
 
-                if job_analysis:
-                    render_language_requirement(job_analysis)
-                    render_visa_sponsorship(job_analysis)
-                if fact_check:
-                    render_fact_check(fact_check)
+            cover_letter, ats_data, job_analysis, fact_check = load_packet_files(job["run_id"])
 
+            if job_analysis:
+                render_language_requirement(job_analysis)
+                render_visa_sponsorship(job_analysis)
+            if fact_check:
+                render_fact_check(fact_check)
+
+            # Side by side instead of stacked — the biggest single space
+            # saver on this card, now that wide layout gives room for it.
+            p1, p2 = st.columns(2)
+            with p1:
                 with st.expander("Preview cover letter"):
                     st.write(cover_letter or "Not available.")
+            with p2:
                 with st.expander("Preview ATS resume sections"):
                     st.json(ats_data or {})
 
-                render_packet_downloads(job["url"], job["company"], cover_letter, ats_data, job_analysis, "pending")
+            render_packet_downloads(job["url"], job["company"], cover_letter, ats_data, job_analysis, "pending")
 
-                a1, a2 = st.columns(2)
-                if a1.button("✅ Approve — I've reviewed this", key=key(f"approve_{job['url']}"), type="primary"):
+            a1, a2, a3 = st.columns(3)
+            if a1.button("✅ Approve — I've reviewed this", key=key(f"approve_{job['url']}"), type="primary"):
+                update_review_status(job["url"], "approved")
+                st.success("Approved. Go apply on the actual job site yourself — this tool never submits anything automatically.")
+                st.rerun()
+            if a2.button("🔄 Regenerate", key=key(f"regenerate_{job['url']}"), help="Not right yet, but not a reject either — try again"):
+                if not job["description"]:
+                    st.error("No stored posting text to regenerate from — reject this one and use the paste option instead.")
+                else:
+                    posting_text = f"{job['title']} at {job['company']}\n\n{job['description']}"
+                    new_run_id = uuid.uuid4().hex[:8]
+                    with st.spinner("Running the crew again — this can take a minute or two..."):
+                        result = run_application_materials_crew(posting_text, new_run_id)
+                    if result["error"]:
+                        st.error(result["error"])
+                    else:
+                        # Re-inserting with a new run_id resets status to
+                        # 'pending' (already was) and points the review at
+                        # the fresh files — the old run's files are simply
+                        # orphaned on disk, cleaned up later via Maintenance.
+                        add_to_review_queue(job["url"], job["title"], job["company"], new_run_id)
+                        st.success("Regenerated — review the new version above.")
+                        st.rerun()
+            if a3.button("❌ Reject", key=key(f"reject_{job['url']}")):
+                update_review_status(job["url"], "rejected")
+                st.rerun()
+
+    # Prominent and uncollapsed on purpose — these still need you to go
+    # apply somewhere in the real world, so they shouldn't be easy to forget.
+    # Gridded two-per-row like the light cards, since an approved card's
+    # content (two download buttons) is compact enough to benefit from it.
+    st.divider()
+    st.subheader(f"✅ Approved — ready to apply ({len(approved)})")
+    if not approved:
+        st.caption("Nothing approved yet.")
+    else:
+        cols = st.columns(2)
+        for i, job in enumerate(approved):
+            with cols[i % 2]:
+                with st.container(border=True):
+                    st.markdown(f"**{job['title']}** — {job['company']}")
+                    st.markdown(f"[View posting]({job['url']})")
+                    if job.get("run_id"):
+                        cover_letter, ats_data, job_analysis, _ = load_packet_files(job["run_id"])
+                        render_packet_downloads(job["url"], job["company"], cover_letter, ats_data, job_analysis, "approved")
+                    b1, b2 = st.columns(2)
+                    if b1.button("📨 Mark as applied", key=key(f"mark_applied_{job['url']}"), type="primary"):
+                        update_review_status(job["url"], "applied")
+                        st.success("Marked as applied.")
+                        st.rerun()
+                    if b2.button("🔄 Undo approval", key=key(f"undo_approve_{job['url']}")):
+                        update_review_status(job["url"], "pending")
+                        st.rerun()
+
+    # A genuinely different completion state from rejected — this is the
+    # "I actually did it" flag, not "I decided against it". Kept as its own
+    # section so you can see at a glance how many applications you've
+    # actually submitted, without it being mixed into rejected/not-a-fit.
+    if applied:
+        with st.expander(f"📨 Applied ({len(applied)})", expanded=False):
+            for job in applied:
+                st.markdown(f"**{job['title']}** — {job['company']}")
+                st.markdown(f"[View posting]({job['url']})")
+                if job.get("run_id"):
+                    cover_letter, ats_data, job_analysis, _ = load_packet_files(job["run_id"])
+                    render_packet_downloads(job["url"], job["company"], cover_letter, ats_data, job_analysis, "applied")
+                if st.button("🔄 Undo — move back to approved", key=key(f"undo_applied_{job['url']}")):
                     update_review_status(job["url"], "approved")
-                    st.success("Approved. Go apply on the actual job site yourself — this tool never submits anything automatically.")
                     st.rerun()
-                if a2.button("❌ Reject", key=key(f"reject_{job['url']}")):
-                    update_review_status(job["url"], "rejected")
-                    st.rerun()
+                st.divider()
 
     if settled:
-        with st.expander(f"History ({len(settled)})"):
+        with st.expander(f"History — rejected / not a fit ({len(settled)})"):
             for job in settled:
                 st.markdown(f"**{STATUS_LABELS.get(job['status'], job['status'])}** — {job['title']} ({job['company']}), first seen {job['first_seen']}")
                 if job["status"] == "bad_fit":
                     if st.button("🔄 Reconsider — move back to new", key=key(f"undo_{job['url']}")):
                         record_feedback(job["url"], None)
                         st.rerun()
-                if job["status"] == "approved" and job.get("run_id"):
-                    cover_letter, ats_data, job_analysis, _ = load_packet_files(job["run_id"])
-                    render_packet_downloads(job["url"], job["company"], cover_letter, ats_data, job_analysis, "history")
+                elif job["status"] == "rejected":
+                    if st.button("🔄 Undo rejection — move back to review", key=key(f"undo_reject_{job['url']}")):
+                        update_review_status(job["url"], "pending")
+                        st.rerun()
                 st.divider()
 
 

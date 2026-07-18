@@ -331,6 +331,35 @@ def search_nav(query: str, token: str, results: int = 20) -> list[dict]:
     return normalized
 
 
+def refetch_description(url: str, source: str) -> str:
+    """Attempts to re-fetch a missing description for a job already sitting
+    in memory. Only works for Arbeitsagentur — its URLs are structured as
+    .../jobdetail/{refnr}, so the refnr needed to call the detail endpoint
+    again can be recovered directly from the stored URL. Other sources have
+    no equivalent 'fetch by ID' capability, so this returns empty for them —
+    manual paste remains the only option there."""
+    if source != "Arbeitsagentur":
+        return ""
+
+    refnr = url.rstrip("/").split("/")[-1]
+    if not refnr:
+        return ""
+
+    import base64
+    encoded_refnr = base64.b64encode(refnr.encode()).decode()
+    detail_url = f"https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/jobdetails/{encoded_refnr}"
+    headers = {"X-API-Key": "jobboerse-jobsuche"}
+
+    try:
+        response = requests.get(detail_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return response.json().get("stellenangebotsBeschreibung", "")
+        print(f"[Arbeitsagentur refetch] {refnr} returned {response.status_code}: {response.text[:300]}")
+    except requests.RequestException as e:
+        print(f"[Arbeitsagentur refetch] Failed for {refnr}: {e}")
+    return ""
+
+
 def search_all_sources(query: str, country_code: str, secrets: dict, results_per_source: int = 20) -> list[dict]:
     """Dispatches to every source configured for this country, merges the
     results, and deduplicates by URL (in case the same posting somehow
